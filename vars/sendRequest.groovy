@@ -7,7 +7,8 @@ Object call(Map aMap) {
     String body = aMap.body ?: ''
     String outputFile = aMap.outputFile ?: ''
     String privateToken = aMap.authPrivateToken ?: ''
-    Boolean quiet = aMap.quiet ?: false
+    Boolean quiet = aMap.quiet ?: env.HTTP_REQUEST_QUIET ? env.HTTP_REQUEST_QUIET.toBoolean() : false
+    Boolean ignoreSslErrors = aMap.ignoreSslErrors ?: false
     List cHeaders = aMap.headers ?: []
     String validResponseCodes = '100:499'
 
@@ -19,7 +20,8 @@ Object call(Map aMap) {
         httpMode: method,
         validResponseCodes: validResponseCodes,
         quiet: quiet,
-        customHeaders: cHeaders
+        customHeaders: cHeaders,
+        ignoreSslErrors: ignoreSslErrors
     ]
 
     if (body) {

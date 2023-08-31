@@ -1,16 +1,19 @@
 #!groovy
 
+String bbCreds = env.JENKINS_URL =~ /(?i)qa-jenkins.ru/ ? '0fd7f3e0-957e-4e3a-8e3b-b383d7af9d8a' : 'git_creds'
+
 library(
     identifier: 'shared_lib@master',
     changelog: false,
     retriever: modernSCM(
         scm: [
             $class: 'GitSCMSource',
-            remote: 'placeholder_git_lib_repo',
-            credentialsId: 'credentialsid',
+            remote: 'https://github.com/DimiDr0l/jenkins.git',
+            credentialsId: bbCreds,
         ],
     )
 )
+
 getGlobalEnv()
 Map testsStatus = [:]
 
@@ -18,7 +21,7 @@ properties([
     parameters([
         string(
             name: 'CONFLUENCE_PAGE_ID',
-            defaultValue: params.CONFLUENCE_PAGE_ID ?: '10381594382',
+            defaultValue: params.CONFLUENCE_PAGE_ID ?: '10381597014',
             trim: true,
             description: 'Id страницы в конфлюенс с квартальным отчетом. Сохраняется последний использованный!'
         ),
@@ -27,7 +30,7 @@ properties([
 
 pipeline {
     agent {
-        label 'dind'
+        label 'masterLin'
     }
 
     triggers {
@@ -38,6 +41,7 @@ pipeline {
         disableConcurrentBuilds()
         skipDefaultCheckout()
         buildDiscarder(logRotator(numToKeepStr: '60', artifactNumToKeepStr: '60'))
+        timeout(time: 360, unit: 'MINUTES')
         ansiColor('xterm')
     }
 
@@ -52,9 +56,9 @@ pipeline {
                     Object projects = tms.searchProjectByName(projectNameSearch)
 
                     projects.each { project ->
-                        Object testPlan = tms.getTestPlansByProjectId(project.id)[0]
-                        if (testPlan?.attributes[env.TMS_CI_ID] && testPlan?.attributes[env.TMS_CI_ID].length() > 0) {
-                            ciId = testPlan.attributes[env.TMS_CI_ID]
+                        Object testPlan = tms.getTestPlansByProjectId(projectId: project.id)[0]
+                        if (testPlan?.attributes && testPlan?.attributes[env.TMS_ATTRIBUTE_CI_ID]) {
+                            ciId = testPlan.attributes[env.TMS_ATTRIBUTE_CI_ID]
                             testsStatus[ciId] = project.name
                         }
                     }
@@ -65,9 +69,9 @@ pipeline {
         stage('Run CI-report job') {
             steps {
                 script {
-                    Object contentPage = confluence.getContentById(id: params.CONFLUENCE_PAGE_ID)
+                    Object parentPage = confluence.getContentById(id: params.CONFLUENCE_PAGE_ID, expand: '')
                     String placeholder = '__ac_placeholder__'
-                    String body = contentPage.body.storage.value
+                    String body = parentPage.body.storage.value
                         .replaceAll('&nbsp;', ' ')
                         .replaceAll('ac:', placeholder)
                     Object xml = xmlUtils.parseText(body)
@@ -81,12 +85,12 @@ pipeline {
                                     retry(5) {
                                         stage(testsStatus[ciId]) {
                                             build(
-                                                job: 'kibchaos/Confluence/CI-report',
+                                                job: 'CI-report',
                                                 wait: true,
                                                 propagate: true,
                                                 parameters: [
                                                     string(name: 'PROJECT_NAME', value: testsStatus[ciId]),
-                                                    string(name: 'PARENT_PAGE_NAME', value: contentPage.title),
+                                                    string(name: 'PARENT_PAGE_ID', value: parentPage.id),
                                                 ]
                                             )
                                         }

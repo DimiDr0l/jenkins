@@ -1,22 +1,25 @@
 #!groovy
 
+String bbCreds = env.JENKINS_URL =~ /(?i)qa-jenkins.ru/ ? '0fd7f3e0-957e-4e3a-8e3b-b383d7af9d8a' : 'git_creds'
+
 library(
     identifier: 'shared_lib@master',
     changelog: false,
     retriever: modernSCM(
         scm: [
             $class: 'GitSCMSource',
-            remote: 'placeholder_git_lib_repo',
-            credentialsId: 'credentialsid',
+            remote: 'https://github.com/DimiDr0l/jenkins.git',
+            credentialsId: bbCreds,
         ],
     )
 )
+
 getGlobalEnv()
 CI_VAL = ''
 
 pipeline {
     agent {
-        label 'dind'
+        label 'masterLin'
     }
 
     options {
@@ -24,6 +27,7 @@ pipeline {
         skipDefaultCheckout()
         buildDiscarder(logRotator(numToKeepStr: '60', artifactNumToKeepStr: '60'))
         ansiColor('xterm')
+        timestamps()
     }
 
     stages {
@@ -32,7 +36,7 @@ pipeline {
                 script {
                     env.LAST_STAGE = env.STAGE_NAME
                     git.repoCheckout(
-                        gitUrl: 'placeholder_git_repo/project-settings.git',
+                        gitUrl: 'https://github.com/DimiDr0l/project-settings.git',
                         branch: 'master',
                     )
                 }
@@ -42,7 +46,7 @@ pipeline {
         stage('Filling CI Attributes') {
             steps {
                 script {
-                    List projectDirs = sh(script: 'ls -d */', returnStdout: true).trim().replaceAll('/', '').split()
+                    List projectDirs = sysUtils.shStdout('ls -d */').replaceAll('/', '').split()
                     projectDirs.each { projectDir ->
                         if (projectDir =~ env.REGEXP_PATTERN_CI) {
                             Map config = readYaml(file: "${projectDir}/config.yml")
@@ -64,7 +68,7 @@ pipeline {
                                         tms.addTestPlansAttributesByProjectId(project.id, [env.TMS_CI_ID])
                                     }
 
-                                    Object testPlan = tms.getTestPlansByProjectId(project.id)[0]
+                                    Object testPlan = tms.getTestPlansByProjectId(projectId: project.id)[0]
                                     testPlan.attributes[env.TMS_CI_ID] = CI_VAL
                                     tms.updateTestPlan(testPlan)
                                 }

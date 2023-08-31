@@ -1,18 +1,20 @@
 #!groovy
 
+String bbCreds = env.JENKINS_URL =~ /(?i)qa-jenkins.ru/ ? '0fd7f3e0-957e-4e3a-8e3b-b383d7af9d8a' : 'git_creds'
+
 library(
     identifier: 'shared_lib@master',
     changelog: false,
     retriever: modernSCM(
         scm: [
             $class: 'GitSCMSource',
-            remote: 'placeholder_git_lib_repo',
-            credentialsId: 'credentialsid',
+            remote: 'https://github.com/DimiDr0l/jenkins.git',
+            credentialsId: bbCreds,
         ],
     )
 )
+
 getGlobalEnv()
-TMS_URL = 'https://testit.example.ru'
 
 // 0 - ошибка проверки, 1 - доступ/актуальность есть, 2 - нет в проекте
 Map configStatus = [
@@ -47,6 +49,11 @@ properties([
             description: 'Ветка конфигов'
         ),
         booleanParam(
+            name: 'CONFLUENCE_PUBLISH',
+            defaultValue: true,
+            description: 'Публикация статуса в confluence'
+        ),
+        booleanParam(
             name: 'RUN_POPULATE_JOB',
             defaultValue: false,
             description: 'Создание проекта/тест плана в Test IT'
@@ -56,6 +63,7 @@ properties([
             choices: [
                 '',
                 'create-project',
+                'current-project',
                 'create-testplan'
             ],
             description: 'Выберите действие'
@@ -65,7 +73,7 @@ properties([
 
 pipeline {
     agent {
-        label 'dind'
+        label 'masterLin'
     }
 
     options {
@@ -78,6 +86,7 @@ pipeline {
         stage('Check project') {
             steps {
                 script {
+                    startStage()
                     if (!params.PROJECT_SETTINGS_ID || !params.CONFLUENCE_PAGE_ID || !params.SETTINGS_BRANCH) {
                         log.fatal 'Не заданы требуемые параметры'
                     }
@@ -127,7 +136,7 @@ pipeline {
                         Object project = tms.searchProjectByName(projectName)
                         if (project) {
                             project = project[0]
-                            Object testPlan = tms.getTestPlansByProjectId(project.id)[0]
+                            Object testPlan = tms.getTestPlansByProjectId(projectId: project.id)[0]
                             String testPlanCreatedDate = (testPlan.createdDate =~ /[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/)[0]
                             if (sysUtils.compareCurrentDate(testPlanCreatedDate, 180)) {
                                 configStatus.testit_project = 1
@@ -135,9 +144,10 @@ pipeline {
                             else {
                                 configStatus.testit_project = 2
                             }
-                            configStatus.testit_testplan_url = TMS_URL + "/projects/${project.globalId}/test-plans/${testPlan.globalId}/plan"
+                            configStatus.testit_testplan_url = env.TMS_URL + "/projects/${project.globalId}/test-plans/${testPlan.globalId}/plan"
                         }
                     }
+                    finishStage()
                 }
             }
         }
@@ -145,46 +155,79 @@ pipeline {
         stage('Check access') {
             steps {
                 script {
-                    Map checksStage = [:]
+                    startStage()
+                    Map checkAccess = [:]
                     Object downstreamJobHostsCheck = [:]
                     Object downstreamJobOpenshiftCheck = [:]
                     if (hostsCheck) {
-                        checksStage.hostsCheck = {
+                        checkAccess.hostsCheck = {
                             stage('Hosts Check') {
-                                downstreamJobHostsCheck = build(
-                                    job: 'kibchaos/check-project-settings',
-                                    wait: true, // Ожидать завершения downstream job
-                                    propagate: false, // Учитывать результат downstream job
-                                    parameters: [
-                                        string(name: 'TAGS', value: 'hosts_check'),
-                                        string(name: 'SETTINGS_BRANCH', value: params.SETTINGS_BRANCH),
-                                        string(name: 'PROJECT_SETTINGS_ID', value: params.PROJECT_SETTINGS_ID),
-                                        [$class: 'BooleanParameterValue', name: 'CHAOSKUBE', value: false]
-                                    ]
+                                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                    downstreamJobHostsCheck = build(
+                                        job: '../check-project-settings',
+                                        wait: true, // Ожидать завершения downstream job
+                                        propagate: true, // Учитывать результат downstream job
+                                        parameters: [
+                                            string(name: 'TAGS', value: 'hosts_check'),
+                                            string(name: 'SETTINGS_BRANCH', value: params.SETTINGS_BRANCH),
+                                            string(name: 'PROJECT_SETTINGS_ID', value: params.PROJECT_SETTINGS_ID),
+                                            [$class: 'BooleanParameterValue', name: 'CHAOSKUBE', value: false]
+                                        ]
+                                    )
+                                }
+                                copyArtifacts(
+                                    filter: 'ansible/*.html',
+                                    optional: true,
+                                    projectName: '../check-project-settings',
+                                    selector: specific(downstreamJobHostsCheck.number.toString())
                                 )
-                                configStatus.hosts_check = downstreamJobHostsCheck.getResult() == 'SUCCESS' ? 1 : 0
+                                configStatus.hosts_check = downstreamJobHostsCheck.result == 'SUCCESS' ? 1 : 0
                             }
                         }
                     }
                     if (openshiftCheck) {
-                        checksStage.openshiftCheck = {
+                        checkAccess.openshiftCheck = {
                             stage('Open Shift Check') {
-                                downstreamJobOpenshiftCheck = build(
-                                    job: 'kibchaos/check-project-settings',
-                                    wait: true, // Ожидать завершения downstream job
-                                    propagate: false, // Учитывать результат downstream job
-                                    parameters: [
-                                        string(name: 'TAGS', value: 'openshift_check'),
-                                        string(name: 'SETTINGS_BRANCH', value: params.SETTINGS_BRANCH),
-                                        string(name: 'PROJECT_SETTINGS_ID', value: params.PROJECT_SETTINGS_ID),
-                                        [$class: 'BooleanParameterValue', name: 'CHAOSKUBE', value: true]
-                                    ]
+                                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                    downstreamJobOpenshiftCheck = build(
+                                        job: '../check-project-settings',
+                                        wait: true, // Ожидать завершения downstream job
+                                        propagate: true, // Учитывать результат downstream job
+                                        parameters: [
+                                            string(name: 'TAGS', value: 'openshift_check'),
+                                            string(name: 'SETTINGS_BRANCH', value: params.SETTINGS_BRANCH),
+                                            string(name: 'PROJECT_SETTINGS_ID', value: params.PROJECT_SETTINGS_ID),
+                                            [$class: 'BooleanParameterValue', name: 'CHAOSKUBE', value: true]
+                                        ]
+                                    )
+                                }
+                                copyArtifacts(
+                                    filter: 'ansible/*.html',
+                                    optional: true,
+                                    projectName: '../check-project-settings',
+                                    selector: specific(downstreamJobOpenshiftCheck.number.toString())
                                 )
-                                configStatus.os_check = downstreamJobOpenshiftCheck.getResult() == 'SUCCESS' ? 1 : 0
+                                configStatus.os_check = downstreamJobOpenshiftCheck.result == 'SUCCESS' ? 1 : 0
                             }
                         }
                     }
-                    parallel checksStage
+                    parallel checkAccess
+
+                    log.info 'Merge report'
+
+                    Object htmlFiles = findFiles(glob: 'ansible/*.html')
+                    String report = ''
+                    if (downstreamJobHostsCheck.result != 'SUCCESS' && hostsCheck) {
+                        report += "<h1><span style='color:#FF0000;'>Hosts Check FAILED</span></h1> ${downstreamJobHostsCheck.absoluteUrl}"
+                    }
+                    if (downstreamJobOpenshiftCheck.result != 'SUCCESS' && openshiftCheck) {
+                        report += "<h1><span style='color:#FF0000;'>Open Shift Check FAILED</span></h1> ${downstreamJobOpenshiftCheck.absoluteUrl}"
+                    }
+                    htmlFiles.each { file ->
+                        report += readFile(file: file.path) + '\n'
+                    }
+                    writeFile(file: params.PROJECT_SETTINGS_ID + '.html', text: report)
+                    finishStage()
                 }
             }
         }
@@ -197,8 +240,9 @@ pipeline {
             }
             steps {
                 script {
+                    startStage()
                     build(
-                        job: 'kibchaos/testit-populate-project',
+                        job: '../testit-populate-project',
                         wait: true, // Ожидать завершения downstream job
                         propagate: true, // Учитывать результат downstream job
                         parameters: [
@@ -208,15 +252,22 @@ pipeline {
                         ]
                     )
                     Object project = tms.searchProjectByName(projectName)[0]
-                    Object testPlan = tms.getTestPlansByProjectId(project.id)[0]
-                    configStatus.testit_testplan_url = TMS_URL + "/projects/${project.globalId}/test-plans/${testPlan.globalId}/plan"
+                    Object testPlan = tms.getTestPlansByProjectId(projectId: project.id)[0]
+                    configStatus.testit_testplan_url = env.TMS_URL + "/projects/${project.globalId}/test-plans/${testPlan.globalId}/plan"
+                    finishStage()
                 }
             }
         }
 
         stage('Confluence publish') {
+            when {
+                expression {
+                    params.CONFLUENCE_PUBLISH
+                }
+            }
             steps {
                 script {
+                    startStage()
                     String ciIdParam = (params.PROJECT_SETTINGS_ID =~ env.REGEXP_PATTERN_CI)[0].toUpperCase()
                     Object contentPage = confluence.getContentById(id: params.CONFLUENCE_PAGE_ID)
                     String placeholder = '__ac_placeholder__'
@@ -314,6 +365,7 @@ pipeline {
                         title: contentPage.title,
                         versionNumber: iterVersionNumber
                     )
+                    finishStage()
                 }
             }
         }
@@ -323,9 +375,12 @@ pipeline {
         always {
             script {
                 log.info 'Done ' + currentBuild.result
+                archiveArtifacts(
+                    allowEmptyArchive: true,
+                    artifacts: '*.html',
+                )
             }
         }
-
         cleanup {
             cleanWs()
         }
@@ -341,4 +396,12 @@ Object xmlStatusLabel(String title, String color, String acPlaceholder, String e
     ).replaceAll('ac:', acPlaceholder)
 
     return xmlUtils.parseText(statusLabel)
+}
+
+void startStage(String msg = env.STAGE_NAME) {
+    log.info 'STARTED STAGE: "' + msg + '"'
+}
+
+void finishStage(String msg = env.STAGE_NAME) {
+    log.info 'FINISH STAGE: "' + msg + '"'
 }

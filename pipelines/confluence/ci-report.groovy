@@ -1,16 +1,19 @@
 #!groovy
 
+String bbCreds = env.JENKINS_URL =~ /(?i)qa-jenkins.ru/ ? '0fd7f3e0-957e-4e3a-8e3b-b383d7af9d8a' : 'git_creds'
+
 library(
     identifier: 'shared_lib@master',
     changelog: false,
     retriever: modernSCM(
         scm: [
             $class: 'GitSCMSource',
-            remote: 'placeholder_git_lib_repo',
-            credentialsId: 'credentialsid',
+            remote: 'https://github.com/DimiDr0l/jenkins.git',
+            credentialsId: bbCreds,
         ],
     )
 )
+
 getGlobalEnv()
 String bodyPage = ''
 String pageTitle = ''
@@ -24,23 +27,17 @@ properties([
             description: 'Название проекта в Test IT'
         ),
         string(
-            name: 'SPACE_KEY',
-            defaultValue: env.CONFLUENCE_SPACE_KEY,
+            name: 'PARENT_PAGE_ID',
+            defaultValue: '',
             trim: true,
-            description: 'Confluence space key'
-        ),
-        string(
-            name: 'PARENT_PAGE_NAME',
-            defaultValue: params.PARENT_PAGE_NAME,
-            trim: true,
-            description: 'Название родительской страницы'
+            description: 'ID родительской страницы'
         ),
     ])
 ])
 
 pipeline {
     agent {
-        label 'docker'
+        label 'masterLin'
     }
 
     options {
@@ -53,9 +50,10 @@ pipeline {
         stage('Download Test IT artifacts') {
             steps {
                 script {
-                    if (!params.PARENT_PAGE_NAME || !params.SPACE_KEY || !params.PROJECT_NAME) {
+                    if (!params.PARENT_PAGE_ID || !params.PROJECT_NAME) {
                         log.fatal 'Не заданы требуемые параметры'
                     }
+                    String projectName = params.PROJECT_NAME.replaceAll(/\[ПРОД\]\s*/, '')
                     Map testStatus = [
                         passed: 0,
                         failed: 0,
@@ -64,12 +62,40 @@ pipeline {
                         blocked: 0,
                         noresults: 0,
                     ]
-                    bodyPage += '<h3 class="container__title h3" style="text-decoration: none;">РАСПРЕДЕЛЕНИЕ ТЕСТОВ ПО РЕЗУЛЬТАТАМ</h3>'
 
                     Object project = tms.searchProjectByName(params.PROJECT_NAME)
                     if (project) {
                         project = project[0]
-                        Object testPlan = tms.getTestPlansByProjectId(project.id)[0]
+                        Object testPlan = tms.getTestPlansByProjectId(projectId: project.id)[0]
+
+                        log.info 'ОБЩИЕ СВЕДЕНИЯ'
+                        bodyPage += '<h3>ОБЩИЕ СВЕДЕНИЯ</h3>'
+                        bodyPage += confluence.templateTable(
+                            'title',
+                            [
+                                [value: 'КЭ'],
+                                [value: 'Наименование'],
+                                [value: 'Ссылка на тест план'],
+                            ]
+                        )
+                        String ciId = ''
+                        if (testPlan?.attributes && testPlan?.attributes[env.TMS_ATTRIBUTE_CI_ID]) {
+                            ciId = testPlan.attributes[env.TMS_ATTRIBUTE_CI_ID]
+                        }
+                        String testPlanUrl = \
+                            '<a href="' +
+                            env.TMS_URL + "/projects/${project.globalId}/test-plans/${testPlan.globalId}/plan" +
+                            '">Test Plan</a>'
+                        bodyPage += confluence.templateTable(
+                            'table',
+                            [
+                                [value: ciId],
+                                [value: projectName],
+                                [value: testPlanUrl],
+                            ]
+                        )
+                        bodyPage += confluence.templateTable('end')
+                        bodyPage += '<h3>РАСПРЕДЕЛЕНИЕ ТЕСТОВ ПО РЕЗУЛЬТАТАМ</h3>'
 
                         log.info 'Get analitics'
                         Object analitics = tms.getAnalyticsByTestPlanId(testPlan.id).countGroupByStatus
@@ -88,7 +114,7 @@ pipeline {
                             testStatus.skipped,
                             testStatus.inprogress
                         )
-                        bodyPage += '<h3 class="container__title h3" style="text-decoration: none;">ДЕТАЛИЗАЦИЯ ТЕСТОВ</h3>'
+                        bodyPage += '<h3>ДЕТАЛИЗАЦИЯ ТЕСТОВ</h3>'
 
                         bodyPage += confluence.templateTable(
                             'title',
@@ -109,7 +135,6 @@ pipeline {
                         }
 
                         String testPlanCreatedDate = (testPlan.createdDate =~ /[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/)[0]
-                        String projectName = params.PROJECT_NAME.replaceAll(/\[ПРОД\]\s*/, '')
                         pageTitle = projectName + '_' + testPlanCreatedDate
 
                         Object lastResults = tms.getLastResultsByTestPlanId(testPlan.id)
@@ -120,25 +145,30 @@ pipeline {
                             String logs = ''
                             String comment = ''
                             if ((test?.lastTestResult).toString() != 'null') {
-                                log.info 'Get "Defect" links by test'
+                                log.info 'Получение дефектных ссылок'
                                 comment = test.lastTestResult.comment
+                                comment = comment.trim() == 'null' ? '' : comment
+                                comment = comment.replaceAll('<', '&lt;').replaceAll('>', '&gt;')
                                 test.lastTestResult.links.findAll { link ->
                                     link.type.toString().equalsIgnoreCase('Defect')
                                 }.findResults { link ->
                                     jiralinks += tmplStatusJira(link.url)
                                 }
 
-                                log.info 'Download attachments'
+                                log.info 'Скачивание артефактов'
                                 test.lastTestResult.attachments.each { attachment ->
                                     if (attachment.size > 0) {
+                                        String fileName = attachment.name.split('\\.')[0]
+                                        String prefixName = attachment.name.split('\\.')[1]
+                                        String resultFile = fileName + '_' + attachment.id + '.' + prefixName
                                         if (attachment.name =~ /(?i)\.png$|\.jpg$/) {
-                                            screenshots += tmplAttachFile(attachment.name)
+                                            screenshots += tmplAttachFile(resultFile)
                                         }
                                         else {
-                                            logs += tmplAttachFile(attachment.name, 'file')
+                                            logs += tmplAttachFile(resultFile, 'file')
                                         }
                                         dir('attachments') {
-                                            tms.downloadAttachmentById(attachment.id, attachment.name)
+                                            tms.downloadAttachmentById(attachment.id, resultFile)
                                         }
                                     }
                                 }
@@ -181,13 +211,16 @@ pipeline {
         stage('Confluence publish') {
             steps {
                 script {
+                    log.info 'Получение родительской страницы'
+                    Object parentPage = confluence.getContentById(id: params.PARENT_PAGE_ID, expand: '')
+                    String pageId = ''
+                    List attachments = []
+                    log.info 'Проверка создана ли страница'
                     Object searchPage = confluence.getContentByTitle(
-                        spaceKey: params.SPACE_KEY,
+                        spaceKey: parentPage.space.key,
                         title: pageTitle.replaceAll(' ', '%20')
                     )?.results[0]
                     // Если страница нашлась обновляем контент
-                    String pageId = ''
-                    List attachments = []
                     if (searchPage) {
                         pageId = searchPage.id
                         log.info 'Обновляем контент на странице ' + env.CONFLUENCE_URL + '/pages/viewpage.action?pageId=' + pageId
@@ -206,36 +239,29 @@ pipeline {
                             attachments += currentAttachments.results.collect { attach -> [title: attach.title, id: attach.id] }
                         }
                     }
-                    // Если не нашлась ищем родительскую страницу
                     else {
-                        Object ancestors = confluence.getContentByTitle(
-                            spaceKey: params.SPACE_KEY,
-                            title: params.PARENT_PAGE_NAME.replaceAll(' ', '%20')
-                        )?.results[0]
-                        if (ancestors) {
-                            Object createPage = confluence.createContent(
-                                spaceKey: params.SPACE_KEY,
-                                title: pageTitle,
-                                ancestorsId: ancestors.id,
-                                body: bodyPage
-                            )
-                            pageId = createPage.id
-                            log.info 'Создаём новую страницу ' + env.CONFLUENCE_URL + '/pages/viewpage.action?pageId=' + pageId
-                        }
-                        else {
-                            log.fatal "Родительская страница ${params.PARENT_PAGE_NAME} не найдена, проверьте параметры запуска"
-                        }
+                        log.info 'Создаём новую страницу'
+                        Object createPage = confluence.createContent(
+                            spaceKey: parentPage.space.key,
+                            title: pageTitle,
+                            ancestorsId: parentPage.id,
+                            body: bodyPage
+                        )
+                        pageId = createPage.id
+                        log.info 'Создали новую страницу ' + env.CONFLUENCE_URL + '/pages/viewpage.action?pageId=' + pageId
                     }
 
-                    dir('attachments') {
-                        log. info 'Upload attachments'
-                        Object files = findFiles(glob: '*')
-                        files.each { file ->
-                            String attachId = ''
-                            if (attachments.findAll { at -> at.title =~ file.name }.findResult { at -> attachId = at.id }) {
-                                confluence.deleteContentById(id: attachId)
+                    if (fileExists('attachments/')) {
+                        dir('attachments') {
+                            log. info 'Загрузка артефактов'
+                            Object files = findFiles(glob: '*')
+                            files.each { file ->
+                                String attachId = ''
+                                if (attachments.findAll { at -> at.title =~ file.name }.findResult { at -> attachId = at.id }) {
+                                    confluence.deleteContentById(id: attachId)
+                                }
+                                confluence.attachment(action: 'create', contentId: pageId, file: file.path)
                             }
-                            confluence.attachment(action: 'create', contentId: pageId, file: file.path)
                         }
                     }
                 }
@@ -247,6 +273,11 @@ pipeline {
         always {
             script {
                 log.info 'Done ' + currentBuild.result
+            }
+        }
+        failure {
+            script {
+                log.debug bodyPage
             }
         }
 

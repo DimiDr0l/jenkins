@@ -1,16 +1,19 @@
 #!groovy
 
+String bbCreds = env.JENKINS_URL =~ /(?i)qa-jenkins.ru/ ? '0fd7f3e0-957e-4e3a-8e3b-b383d7af9d8a' : 'git_creds'
+
 library(
     identifier: 'shared_lib@master',
     changelog: false,
     retriever: modernSCM(
         scm: [
             $class: 'GitSCMSource',
-            remote: 'placeholder_git_lib_repo',
-            credentialsId: 'credentialsid',
+            remote: 'https://github.com/DimiDr0l/jenkins.git',
+            credentialsId: bbCreds,
         ],
     )
 )
+
 getGlobalEnv()
 Map testsStatus = [:]
 
@@ -18,7 +21,7 @@ properties([
     parameters([
         string(
             name: 'CONFLUENCE_PAGE_ID',
-            defaultValue: params.CONFLUENCE_PAGE_ID ?: '10381594382',
+            defaultValue: params.CONFLUENCE_PAGE_ID ?: '10381597014',
             trim: true,
             description: 'Id страницы в конфлюенс. Сохраняется последний использованный!'
         ),
@@ -27,12 +30,13 @@ properties([
 
 pipeline {
     agent {
-        label 'dind'
+        label 'masterLin'
     }
 
     triggers {
-        // parameterizedCron("00 07 * * * %CONFLUENCE_PAGE_ID=${params.CONFLUENCE_PAGE_ID};")
-        cron('00 06 * * *')
+        parameterizedCron('''\
+            00 07 * * * %CONFLUENCE_PAGE_ID=10381597014;
+            ''')
     }
 
     options {
@@ -54,65 +58,82 @@ pipeline {
 
                     projects.each { project ->
                         String projectName = project.name.replaceAll(/\[ПРОД\]\s*/, '')
-                        Object testPlan = tms.getTestPlansByProjectId(project.id)[0]
-                        Object analitics = tms.getAnalyticsByTestPlanId(testPlan.id).countGroupByStatus
-                        if (testPlan?.attributes[env.TMS_CI_ID] && testPlan?.attributes[env.TMS_CI_ID].length() > 0) {
-                            ciId = testPlan.attributes[env.TMS_CI_ID]
-                            Map testStatus = [
-                                passed: 0,
-                                failed: 0,
-                                skipped: 0,
-                                inprogress: 0,
-                                blocked: 0,
-                                noresults: 0,
-                            ]
+                        Object testPlan = tms.getTestPlansByProjectId(projectId: project.id)[0]
 
-                            Integer testTotal = 0
-                            testStatus.each { stat ->
-                                analitics.findAll { astat ->
-                                    stat.key.equalsIgnoreCase(astat.status)
-                                }.findResults { val ->
-                                    testStatus[stat.key] = val.value
-                                    testTotal += val.value
+                        if (testPlan?.attributes && testPlan?.attributes[env.TMS_ATTRIBUTE_CI_ID]) {
+                            Integer currenetYear = sysUtils.getDate('yyyy').toInteger()
+                            Integer testPlanCreatedYear = (testPlan.createdDate =~ /[0-9][0-9][0-9][0-9]/)[0].toInteger()
+
+                            if (currenetYear == testPlanCreatedYear) {
+                                Object analitics = tms.getAnalyticsByTestPlanId(testPlan.id).countGroupByStatus
+                                ciId = testPlan.attributes[env.TMS_ATTRIBUTE_CI_ID]
+                                Map testStatus = [
+                                    passed: 0,
+                                    failed: 0,
+                                    skipped: 0,
+                                    inprogress: 0,
+                                    blocked: 0,
+                                    noresults: 0,
+                                ]
+
+                                Integer testTotal = 0
+                                testStatus.each { stat ->
+                                    analitics.findAll { astat ->
+                                        stat.key.equalsIgnoreCase(astat.status)
+                                    }.findResults { val ->
+                                        testStatus[stat.key] = val.value
+                                        testTotal += val.value
+                                    }
                                 }
-                            }
 
-                            // Ищем в последнем тест ране ссылки на jira
-                            testStatus.testtotal = testTotal
-                            testStatus.jiralinks = []
-                            Integer totalJiraLinks = 0
-                            Object lastResults = tms.getLastResultsByTestPlanId(testPlan.id)
-                            lastResults.findAll { lastResult ->
-                                lastResult.status.equalsIgnoreCase('Failed')
-                            }.findResults { lastResult ->
-                                lastResult.lastTestResult.links.findAll { links ->
-                                    links.type.toString().equalsIgnoreCase('Defect')
-                                }.findResults { links ->
-                                    totalJiraLinks++
-                                    testStatus.jiralinks += links.url
+                                // Ищем в последнем тест ране ссылки на jira
+                                testStatus.testtotal = testTotal
+                                testStatus.jiralinks = []
+                                Integer totalJiraLinks = 0
+                                Object lastResults = tms.getLastResultsByTestPlanId(testPlan.id)
+                                lastResults.findAll { lastResult ->
+                                    lastResult.status.equalsIgnoreCase('Failed')
+                                }.findResults { lastResult ->
+                                    lastResult.lastTestResult.links.findAll { links ->
+                                        links.type.toString().equalsIgnoreCase('Defect')
+                                    }.findResults { links ->
+                                        totalJiraLinks++
+                                        testStatus.jiralinks += links.url
+                                    }
                                 }
-                            }
-                            testStatus.jiralinks = testStatus.jiralinks.unique()
-                            testStatus.totaljiralinks = totalJiraLinks
+                                testStatus.jiralinks = testStatus.jiralinks.unique()
+                                testStatus.totaljiralinks = totalJiraLinks
 
-                            // Подсчёт %
-                            Integer percentComplete = (
-                                testStatus.passed +
-                                testStatus.inprogress +
-                                testStatus.blocked +
-                                testStatus.failed
-                            ) / testTotal * 100
+                                Integer skippedManual = 0
+                                lastResults.findAll { lastResult ->
+                                    lastResult.status.equalsIgnoreCase('Skipped')
+                                }.findResults { lastResult ->
+                                    if (lastResult.lastTestResult.comment =~ /(?i)skipped/) {
+                                        skippedManual++
+                                    }
+                                }
+                                testStatus.skippedManual = skippedManual
 
-                            // Если тест план заблокирован, все тесты прошли, заведены дефекты то выставляем 101
-                            if (testPlan.status.equalsIgnoreCase('Completed') \
-                                    && testStatus.passed + testStatus.failed == testStatus.testtotal \
-                                    && testStatus.failed == testStatus.totaljiralinks) {
-                                log.info "Project ${projectName} is completed"
-                                percentComplete = 101
+                                // Подсчёт %
+                                Integer percentComplete = (
+                                    testStatus.passed +
+                                    testStatus.inprogress +
+                                    testStatus.blocked +
+                                    testStatus.failed +
+                                    testStatus.skippedManual
+                                ) / testTotal * 100
+
+                                // Если тест план заблокирован, все тесты прошли, заведены дефекты то выставляем 101
+                                if (testPlan.status.equalsIgnoreCase('Completed') \
+                                        && testStatus.passed + testStatus.failed == testStatus.testtotal \
+                                        && testStatus.failed == testStatus.totaljiralinks) {
+                                    log.info "Project ${projectName} is completed"
+                                    percentComplete = 101
+                                }
+                                testStatus.percentcomplete = percentComplete
+                                testStatus.project = projectName
+                                testsStatus[ciId] = testStatus
                             }
-                            testStatus.percentcomplete = percentComplete
-                            testStatus.project = projectName
-                            testsStatus[ciId] = testStatus
                         }
                     }
                 }
@@ -138,6 +159,7 @@ pipeline {
                                     Object testStatus = testsStatus[ciId]
                                     Integer passed = testStatus.passed
                                     Integer failed = testStatus.failed
+                                    Integer skippedManual = testStatus.skippedManual
                                     // List jiralinks = testStatus.jiralinks // пока не используется
                                     Integer testtotal = testStatus.testtotal
                                     Integer totaljiralinks = testStatus.totaljiralinks
@@ -150,7 +172,7 @@ pipeline {
                                         percentComplete > 100 ? 'ДА' : percentComplete.toString() + '%', colorCell, placeholder
                                     )
                                     // Колонка "Проставлены Passed/Failed", если все тесты завершены (ячейка 11)
-                                    if (passed + failed == testtotal) {
+                                    if (passed + failed + skippedManual == testtotal) {
                                         tr?.td[10].div = xmlStatusLabel('ДА', 'Green', placeholder)
                                         // Колонка "Заведены дефекты", проверка на jira ссылки (ячейка 12)
                                         if (failed <= totaljiralinks) {
@@ -193,7 +215,6 @@ pipeline {
                         .replaceAll(placeholder, 'ac:')
 
                     Integer iterVersionNumber = contentPage.version.number + 1
-
                     confluence.updateContentById(
                         id: params.CONFLUENCE_PAGE_ID,
                         body: body,
@@ -225,6 +246,5 @@ Object xmlStatusLabel(String title, String color, String acPlaceholder) {
         '<ac:parameter ac:name="title">' + title + '</ac:parameter>' +
         '</ac:structured-macro></p>'
     ).replaceAll('ac:', acPlaceholder)
-
     return xmlUtils.parseText(statusLabel)
 }

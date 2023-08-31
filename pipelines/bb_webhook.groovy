@@ -1,13 +1,15 @@
 #!groovy
 
+String bbCreds = env.JENKINS_URL =~ /(?i)qa-jenkins.ru/ ? '0fd7f3e0-957e-4e3a-8e3b-b383d7af9d8a' : 'git_creds'
+
 library(
     identifier: 'shared_lib@master',
     changelog: false,
     retriever: modernSCM(
         scm: [
             $class: 'GitSCMSource',
-            remote: 'placeholder_git_lib_repo',
-            credentialsId: 'credentialsid',
+            remote: 'https://github.com/DimiDr0l/jenkins.git',
+            credentialsId: bbCreds,
         ],
     )
 )
@@ -18,7 +20,7 @@ Object downstreamJob
 Map jobInfo = [:]
 REGEXP_PATTERN = /check_ci:.*/
 TEST_RUN_ID = ''
-KIBCHAOS_BRANCH = ''
+ANSIBLE_BRANCH = ''
 GIT_HASH = ''
 TMS_TEST_TAGS = ''
 TMS_PROJECT_NAME = ''
@@ -33,7 +35,7 @@ properties([
         ),
         string(
             name: 'PROJECT_SETTINGS_ID',
-            defaultValue: 'chaos-team-dm-dev',
+            defaultValue: 'project-id',
             trim: true,
             description: \
                 'Name folder in project settings<br>'
@@ -47,13 +49,13 @@ properties([
 
 pipeline {
     agent {
-        label 'linux'
+        label 'masterLin'
     }
 
     triggers {
         parameterizedCron('''
             00 01 * * * %CRON_RUN=true;TMS_TEST_TAGS=blade_cpu,blade_ram,tc_network_loss,tc_network_delay,tc_network_corrupt,tc_network_combo,stress_hdd_rw,stress_hdd_space,process_pause,reboot;
-            00 02 * * * %CRON_RUN=true;TMS_TEST_TAGS=os_kill_pods,os_fail_pods,os_blade_cpu_containers,os_blade_ram_containers;
+            30 03 * * * %CRON_RUN=true;TMS_TEST_TAGS=os_kill_pods,os_fail_pods,os_blade_cpu_containers,os_blade_ram_containers;
         ''')
         GenericTrigger(
             genericVariables: [
@@ -118,9 +120,9 @@ pipeline {
         disableConcurrentBuilds()
         skipDefaultCheckout()
         buildDiscarder(logRotator(numToKeepStr: '60', artifactNumToKeepStr: '60'))
-        timestamps()
         timeout(time: 3, unit: 'HOURS')
         ansiColor('xterm')
+        timestamps()
     }
 
     stages {
@@ -136,13 +138,13 @@ pipeline {
                         }
                     }
                     if (params.CRON_RUN) {
-                        KIBCHAOS_BRANCH = 'master'
-                        GIT_HASH = bbUtils.getCommits(limit: 1, branch: KIBCHAOS_BRANCH).values[0].id
+                        ANSIBLE_BRANCH = 'master'
+                        GIT_HASH = bbUtils.getCommits(limit: 1, branch: ANSIBLE_BRANCH).values[0].id
                     } else {
-                        KIBCHAOS_BRANCH = "${env.PUSH_BRANCH == '-' ? env.PR_FROM : env.PUSH_BRANCH ?: '-'}"
+                        ANSIBLE_BRANCH = "${env.PUSH_BRANCH == '-' ? env.PR_FROM : env.PUSH_BRANCH ?: '-'}"
                         GIT_HASH = "${env.PUSH_HASH == '-' ? env.PR_FROM_HASH : env.PUSH_HASH ?: '-'}"
                     }
-                    if (!KIBCHAOS_BRANCH || KIBCHAOS_BRANCH == '-' || !GIT_HASH || GIT_HASH == '-') {
+                    if (!ANSIBLE_BRANCH || ANSIBLE_BRANCH == '-' || !GIT_HASH || GIT_HASH == '-') {
                         log.fatal 'Webhook error'
                     }
                     // Get TMS_PROJECT_NAME from repo project-settings
@@ -189,7 +191,7 @@ pipeline {
                     }
 
                     log.info \
-                        "KIBCHAOS_BRANCH: ${KIBCHAOS_BRANCH}\n" +
+                        "ANSIBLE_BRANCH: ${ANSIBLE_BRANCH}\n" +
                         "GIT_HASH: ${GIT_HASH}\n" +
                         "PUSH_BRANCH: ${env.PUSH_BRANCH}\n" +
                         "PUSH_HASH: ${env.PUSH_HASH}\n" +
@@ -216,7 +218,7 @@ pipeline {
                 script {
                     env.LAST_STAGE = env.STAGE_NAME
                     String projectId = tms.searchProjectByName(TMS_PROJECT_NAME)[0].id
-                    String testPlanId = tms.getTestPlansByProjectId(projectId)[0].id
+                    String testPlanId = tms.getTestPlansByProjectId(projectId: projectId)[0].id
                     List testSuites = tms.getTestSuitesByTestPlanId(testPlanId)
                         .collectMany { cID -> cID.id ?: [] }
 
@@ -224,7 +226,15 @@ pipeline {
                     List testPointsNoStatus = testPoints.collectMany { point ->
                         point.status == 'NoResults' ? [] : point.id
                     }
-                    // reset test plan status
+
+                    // Stop in progress test run
+                    Object testRuns = tms.getTestRunsByProjectId(projectId)
+                    testRuns.each { testRun ->
+                        log.info 'Stop in progress test run'
+                        skipTests(testRun)
+                    }
+
+                    // Reset test plan status
                     if (testPointsNoStatus) {
                         tms.resetTestPointsStatusOfTestPlanId(testPlanId, testPointsNoStatus)
                     }
@@ -272,14 +282,15 @@ pipeline {
                 script {
                     env.LAST_STAGE = env.STAGE_NAME
                     downstreamJob = build(
-                        job: 'testit-auto-d',
+                        job: '../testit-auto-d',
                         wait: true, // Ожидать завершения downstream job
                         propagate: true, // Учитывать результат downstream job
                         parameters: [
                             string(name: 'TEST_RUN_ID', value: TEST_RUN_ID),
-                            string(name: 'KIBCHAOS_BRANCH', value: KIBCHAOS_BRANCH),
+                            string(name: 'ANSIBLE_BRANCH', value: ANSIBLE_BRANCH),
                             string(name: 'PROJECT_SETTINGS_ID', value: params.PROJECT_SETTINGS_ID),
                             [$class: 'BooleanParameterValue', name: 'DEBUG', value: false],
+                            [$class: 'BooleanParameterValue', name: 'CRON_RUN', value: params.CRON_RUN],
                         ]
                     )
                 }
@@ -313,4 +324,24 @@ pipeline {
             cleanWs()
         }
     }
+}
+
+void skipTests(Object testRun) {
+    List testResults = []
+    testRun.testResults.findAll { test ->
+        test.outcome.equalsIgnoreCase('InProgress')
+    }.findResults { test ->
+        testResults += [
+            configurationId: test.configuration.id,
+            autoTestExternalId: test.autoTest.externalId,
+            outcome: 'Skipped',
+            message: 'Skipped because jenkins job failed',
+        ]
+    }
+    tms.setResultToTestRuns(testRun.id, testResults)
+    String [] tests = testRun.testResults.collect { test ->
+        test.outcome.equalsIgnoreCase('InProgress') ? test.autoTest.name : []
+    }
+    .findAll()
+    log.info 'Skipped tests: \n' + tests.join('\n')
 }

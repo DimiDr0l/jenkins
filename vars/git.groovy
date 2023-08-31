@@ -33,3 +33,20 @@ void repoCheckout(Map aMap) {
         ]
     )
 }
+
+void push(String branch, String gitCreds = env.BITBUCKET_CREDS) {
+    String filePath = env.WORKSPACE + '/git_helper.sh'
+    writeFile(
+        file: filePath,
+        text: '''\
+            #!/usr/bin/bash
+            echo username="$GIT_USERNAME"
+            echo password="$GIT_PASSWORD"
+            '''.stripIndent()
+    )
+    sh 'git config push.default simple'
+    sh 'git config credential.helper "/bin/bash ' + filePath + '"'
+    withCredentials([usernamePassword(credentialsId: gitCreds, passwordVariable: 'GIT_PASSWORD', usernameVariable: 'GIT_USERNAME')]) {
+        sh 'git push origin HEAD:' + branch
+    }
+}

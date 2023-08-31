@@ -22,8 +22,8 @@ properties([
             name: 'GROUP',
             choices: [
                 '',
-                'alpha',
-                'sigma'
+                'one',
+                'two'
             ],
             description: 'Host group in the inventory'
         ),
@@ -39,13 +39,6 @@ properties([
 pipeline {
     agent {
         label 'dind'
-    }
-
-    triggers {
-        parameterizedCron('''
-            00 06 * * * %GROUP=alpha;
-            30 06 * * * %GROUP=sigma;
-        ''')
     }
 
     options {

@@ -132,7 +132,7 @@ Object attachment(Map aMap) {
 
     String stdout = ''
     withCredentials([usernameColonPassword(credentialsId: auth, variable: 'auth')]) {
-        String command = 'curl -sS -u $auth --retry 3 --retry-delay 3 '
+        String command = 'curl -sS -u $auth '
         if (action) {
             command += \
                 ' -X POST -H "X-Atlassian-Token: nocheck" ' +
@@ -143,7 +143,9 @@ Object attachment(Map aMap) {
         else {
             command += " -X GET '${url}/rest/api/content/${contentId}/child/attachment?limit=${limit}&start=${start}'"
         }
-        stdout = sh(script: command, returnStdout: true).trim()
+        retry(3) {
+            stdout = sh(script: command, returnStdout: true).trim()
+        }
     }
 
     try {

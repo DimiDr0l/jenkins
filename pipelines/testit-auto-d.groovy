@@ -1,21 +1,25 @@
 #!groovy
 
+String bbCreds = env.JENKINS_URL =~ /(?i)qa-jenkins.ru/ ? '0fd7f3e0-957e-4e3a-8e3b-b383d7af9d8a' : 'git_creds'
+
 library(
     identifier: 'shared_lib@master',
     changelog: false,
     retriever: modernSCM(
         scm: [
             $class: 'GitSCMSource',
-            remote: 'placeholder_git_lib_repo',
-            credentialsId: 'credentialsid',
+            remote: 'https://github.com/DimiDr0l/jenkins.git',
+            credentialsId: bbCreds,
         ],
     )
 )
 getGlobalEnv()
 
+List testProjects = []
+String testRunUrl = ''
 SETTINGS_REPO = params.SETTINGS_REPO
 SETTINGS_BRANCH = params.SETTINGS_BRANCH
-KIBCHAOS_BRANCH = params.KIBCHAOS_BRANCH
+ANSIBLE_BRANCH = params.ANSIBLE_BRANCH
 TEST_RUN_ID = params.TEST_RUN_ID
 PROJECT_SETTINGS_ID = params.PROJECT_SETTINGS_ID
 DEBUG = params.DEBUG
@@ -27,7 +31,7 @@ properties([
     parameters([
         string(
             name: 'SETTINGS_REPO',
-            defaultValue: 'placeholder_git_repo/project-settings.git',
+            defaultValue: 'https://github.com/DimiDr0l/project-settings.git',
             trim: true,
             description: 'Репозиторий конфигов'
         ),
@@ -38,10 +42,10 @@ properties([
             description: 'Ветка конфигов'
         ),
         string(
-            name: 'KIBCHAOS_BRANCH',
+            name: 'ANSIBLE_BRANCH',
             defaultValue: 'master',
             trim: true,
-            description: 'Ветка репы kibchaos'
+            description: 'Ветка репы'
         ),
         string(
             name: 'TEST_RUN_ID',
@@ -72,23 +76,26 @@ properties([
 
 pipeline {
     agent {
-        label 'dind'
+        kubernetes(k8sagent())
     }
+
     triggers {
         GenericTrigger(
             genericRequestVariables: [
                 [key: 'SETTINGS_REPO'],
                 [key: 'SETTINGS_BRANCH'],
-                [key: 'KIBCHAOS_BRANCH'],
+                [key: 'ANSIBLE_BRANCH'],
                 [key: 'TEST_RUN_ID'],
                 [key: 'PROJECT_SETTINGS_ID'],
                 [key: 'DEBUG'],
                 [key: 'DRY_RUN'],
-                [key: 'MULTI_TEST_RUNS']
+                [key: 'MULTI_TEST_RUNS'],
+                [key: 'CONTAINER_LIMITS_MEMORY'],
+                [key: 'CONTAINER_LIMITS_CPU']
             ],
             causeString: 'Triggered on $TEST_RUN_ID',
             tokenCredentialId: 'devbuildTriggerToken',
-            printContributedVariables: false,
+            printContributedVariables: true,
             printPostContent: true,
             silentResponse: false,
         )
@@ -96,9 +103,9 @@ pipeline {
     options {
         skipDefaultCheckout()
         buildDiscarder(logRotator(numToKeepStr: '60', artifactNumToKeepStr: '60'))
-        timestamps()
         timeout(time: 24, unit: 'HOURS')
         ansiColor('xterm')
+        timestamps()
     }
 
     environment {
@@ -108,17 +115,20 @@ pipeline {
         INVENTORY = "${PROJECT_DIR}/inventory"
         VAULT_FILE = "${PROJECT_DIR}/vault.yml"
         VAULT_PASSWORD = "${PROJECT_DIR}/vault-password-file"
-        VAULT_PASS_CREDS = 'kibchaos-vault'
         PRIVATE_KEY = "${PROJECT_DIR}/private_key"
-        PRIVATE_KEY_CREDS = 'chaos_key'
-        ORDER = "${PROJECT_DIR}/.order"
 
-        ANSIBLE_CONFIG = "${WORKSPACE}/ansible/ansible.cfg"
+        ANSIBLE_DIR = "${WORKSPACE}/ansible"
+        ANSIBLE_CONFIG = "${ANSIBLE_DIR}/ansible.cfg"
+
+        TMS_API_URL = "${env.TMS_URL}/api/v2"
 
         PLAY_EXTRAS = \
             " -e @${CONFIG_PATH} " +
-            " -e @${VAULT_FILE} " +
+            " -e output_dir=${WORKSPACE} " +
+            " -e ansible_ssh_private_key_file=${PRIVATE_KEY} " +
             " -e testrun_id=${TEST_RUN_ID} " +
+            " -i ${INVENTORY} " +
+            " -e @${VAULT_FILE} " +
             " --vault-password-file ${VAULT_PASSWORD} " +
             " ${ANSIBLE_VERBOSE}"
     }
@@ -134,16 +144,14 @@ pipeline {
                             aborted()
                         }
                     }
-                    if (!SETTINGS_REPO || !SETTINGS_BRANCH || !TEST_RUN_ID || !PROJECT_SETTINGS_ID || !KIBCHAOS_BRANCH) {
+                    if (!SETTINGS_REPO || !SETTINGS_BRANCH || !TEST_RUN_ID || !PROJECT_SETTINGS_ID || !ANSIBLE_BRANCH) {
                         log.fatal(
                             'Не задан один из параметров:\n' +
                             "SETTINGS_REPO: ${SETTINGS_REPO}\n" +
                             "SETTINGS_BRANCH: ${SETTINGS_BRANCH}\n" +
-                            "KIBCHAOS_BRANCH: ${KIBCHAOS_BRANCH}\n" +
+                            "ANSIBLE_BRANCH: ${ANSIBLE_BRANCH}\n" +
                             "TEST_RUN_ID: ${TEST_RUN_ID}\n" +
-                            "PROJECT_SETTINGS_ID: ${PROJECT_SETTINGS_ID}\n" +
-                            "DRY_RUN: ${DRY_RUN}\n" +
-                            "MULTI_TEST_RUNS: ${MULTI_TEST_RUNS}\n"
+                            "PROJECT_SETTINGS_ID: ${PROJECT_SETTINGS_ID}\n"
                         )
                     }
                     finishStage()
@@ -162,8 +170,8 @@ pipeline {
                     env.LAST_STAGE = env.STAGE_NAME
                     startStage()
                     git.repoCheckout(
-                        gitUrl: 'placeholder_git_repo/kibchaos.git',
-                        branch: KIBCHAOS_BRANCH,
+                        gitUrl: 'https://github.com/DimiDr0l/ansible.git',
+                        branch: ANSIBLE_BRANCH,
                     )
                     git.repoCheckout(
                         gitUrl: SETTINGS_REPO,
@@ -185,10 +193,21 @@ pipeline {
                 script {
                     env.LAST_STAGE = env.STAGE_NAME
                     startStage()
+                    // hack test_execution_time & time_between_tests
+                    if (!params.CRON_RUN && params.PROJECT_SETTINGS_ID == 'project-id' && sysUtils.getBuildCauses() != 'generic') {
+                        log.debug 'Hack: test_execution_time=120 & time_between_tests=30'
+                        Object aMapconfig = readYaml(file: "${env.PROJECT_DIR}/config.yml")
+                        aMapconfig.test_execution_time = 120
+                        aMapconfig.time_between_tests = 30
+                        writeYaml(file: "${env.PROJECT_DIR}/config.yml", data: aMapconfig, overwrite: true)
+                    }
+
                     // Get the TestRun status
-                    Object testRun = tms.getTestRunById(params.TEST_RUN_ID)
+                    Object testRun = tms.getTestRunById(TEST_RUN_ID)
                     // Get the project info
                     Object project = tms.getProjectById(testRun.projectId)
+                    Object testPlan = tms.getTestPlanById(testRun.testPlanId)
+                    testRunUrl = "\n[TestRunUrl](${env.TMS_URL}/projects/${project.globalId}/test-plans/${testPlan.globalId}/test-runs/${testRun.id})\n"
                     String projectFromConfig = readYaml(file: "${env.PROJECT_DIR}/config.yml").tms_project_name
 
                     // Validate webhook configuration
@@ -202,7 +221,9 @@ pipeline {
 
                     if (!params.MULTI_TEST_RUNS && tms.getTestRunsByProjectId(testRun.projectId)) {
                         List testResults = []
-                        testRun.testResults.each { test ->
+                        testRun.testResults.findAll { test ->
+                            test.outcome.equalsIgnoreCase('InProgress')
+                        }.findResults { test ->
                             testResults += [
                                 configurationId: test.configuration.id,
                                 autoTestExternalId: test.autoTest.externalId,
@@ -212,13 +233,13 @@ pipeline {
                         }
                         // Set tests of the testrun status to Skipped
                         log.info 'Set tests of the testrun status to Skipped'
-                        tms.setResultToTestRuns(params.TEST_RUN_ID, testResults)
-                        aborted()
+                        tms.setResultToTestRuns(TEST_RUN_ID, testResults)
+                        log.fatal 'Parallel start prohibited'
                     }
                     else if (testRun.stateName.equalsIgnoreCase('NotStarted')) {
                         // Start the TestRun
                         log.info 'Start the TestRun'
-                        tms.actionTestRunById(params.TEST_RUN_ID, 'start')
+                        tms.actionTestRunById(TEST_RUN_ID, 'start')
                     }
                     finishStage()
                 }
@@ -242,56 +263,49 @@ pipeline {
                         'Low': 4,
                         'Lowest': 5,
                     ]
-                    // Get the TestRun status
-                    Object testRun = tms.getTestRunById(params.TEST_RUN_ID)
-                    List testProjects = []
-
-                    if (testRun.stateName.equalsIgnoreCase('Stopped')) {
-                        aborted()
-                    }
-                    else {
-                        Map testNameConfigs = [:]
-                        testRun.testResults*.configuration.name
-                        .unique()
-                        .each { name ->
-                            testRun.testResults.findAll { test ->
-                                test.configuration.name == name
-                            }
-                            .findResults { test ->
-                                testNameConfigs[name] = test.configuration.capabilities.Priority
-                            }
+                    Object testRun = tms.getTestRunById(TEST_RUN_ID)
+                    Map testNameConfigs = [:]
+                    testRun.testResults*.configuration.name
+                    .unique()
+                    .each { name ->
+                        testRun.testResults.findAll { test ->
+                            test.configuration.name == name
                         }
+                        .findResults { test ->
+                            testNameConfigs[name] = test.configuration.parameters.Priority
+                        }
+                    }
 
-                        testNameConfigs.each { nameConfig ->
-                            List tests = []
-                            testRun.testResults.findAll { test ->
-                                test.configuration.name == nameConfig.key
-                            }.findResults { test ->
-                                String priority = tms.getWorkItemById(test.testPoint.workItemId, test.workItemVersionId).priority
-                                tests += [
-                                    name: test.autoTest?.labels[0].name,
-                                    namespace: test.autoTest.namespace,
-                                    priority: priorityMap[priority],
-                                ]
-                            }
-                            testProjects += [
-                                name: nameConfig.key,
-                                priority: nameConfig.value,
-                                autotests: tests
+                    testNameConfigs.each { nameConfig ->
+                        List tests = []
+                        testRun.testResults.findAll { test ->
+                            test.configuration.name == nameConfig.key
+                        }.findResults { test ->
+                            String priority = tms.getWorkItemById(test.testPoint.workItemId, test.workItemVersionId).priority
+                            tests += [
+                                name: test.autoTest?.labels[0].name,
+                                namespace: test.autoTest.namespace,
+                                priority: priorityMap[priority],
                             ]
                         }
-
-                        String contextOrderFile = ''
-                        testProjects.each { project ->
-                            String tags = project.autotests*.name.join(' ')
-                            contextOrderFile += project.name + '=' + tags + '\n'
+                        // Sorting by priority
+                        List testsSort = []
+                        List prioritys = tests*.priority.sort().unique()
+                        prioritys.each { priority ->
+                            testsSort += tests.findAll { test ->
+                                test.priority == priority
+                            }
                         }
-                        writeJSON(json: testProjects, file: "${env.PROJECT_DIR}/.order.json")
-                        writeFile(text: contextOrderFile, file: env.ORDER)
 
-                        log.info '\n' + contextOrderFile
-                        // log.info '\n' + writeJSON(json: testProjects, returnText: true)
+                        testProjects += [
+                            name: nameConfig.key,
+                            priority: nameConfig.value,
+                            autotests: testsSort
+                        ]
                     }
+
+                    writeJSON(json: testProjects, file: "${env.PROJECT_DIR}/.order.json")
+                    log.info '\n' + writeJSON(json: testProjects, returnText: true)
                     finishStage()
                 }
             }
@@ -318,7 +332,7 @@ pipeline {
             }
         }
 
-        stage('Run tests') {
+        stage('Run tests:') {
             when {
                 expression {
                     currentBuild.currentResult == 'SUCCESS'
@@ -328,15 +342,61 @@ pipeline {
                 script {
                     env.LAST_STAGE = env.STAGE_NAME
                     startStage()
-                    try {
-                        ansibleExecute(
-                            command: './bin/run.sh'
-                        )
-                    } catch (err) {
-                        if ("${err}".split(' ').last() == '5') {
-                            aborted()
-                        } else {
-                            log.fatal 'Errors occurred during tests execution'
+                    testProjects.each { project ->
+                        String group = project.name
+                        project.autotests.each { test ->
+                            String testName = test.name
+                            String startTimeTest = sysUtils.shStdout('date +%s%3N')
+                            String outcome = 'Blocked'
+                            String message = "Test_${testName}_passed"
+                            String testLog = "${WORKSPACE}/${testName}_${group}.log"
+                            String cmdRunTest = "ansible-playbook ${env.ANSIBLE_DIR}/${testName}.yml ${env.PLAY_EXTRAS} -l ${group} -e autotest=${testName} -e test_log=${testLog} | tee ${testLog}"
+
+                            if (DRY_RUN) {
+                                log.warning "DRY RUN: ${cmdRunTest}"
+                            }
+                            else {
+                                String stateName = tms.getTestRunById(TEST_RUN_ID).stateName
+                                stage(testName) {
+                                    startStage()
+                                    if (stateName.equalsIgnoreCase('Stopped')) {
+                                        aborted('Aborted by Test IT')
+                                    }
+                                    else {
+                                        try {
+                                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                                ansibleExecute(
+                                                    command: cmdRunTest
+                                                )
+                                            }
+                                        }
+                                        catch (err) {
+                                            outcome = 'Skipped'
+                                            message = 'Skipped_by_test_fail'
+                                            sleep 300
+                                        }
+
+                                        log.info 'Sending results to Test IT'
+                                        withCredentials([string(credentialsId: env.TMS_AUTH_TOKEN, variable: 'VAULT_TMS_TOKEN')]) {
+                                            String paramsSendResult = \
+                                                "${env.PLAY_EXTRAS}" +
+                                                " -e configuration=${group} " +
+                                                " -e test_log=${testLog} " +
+                                                " -e autotest=${testName} " +
+                                                " -e outcome=${outcome} " +
+                                                " -e message=${message} " +
+                                                " -e BUILD_URL=${env.BUILD_URL} " +
+                                                " -e test_start_time=${startTimeTest}" +
+                                                " -e tms_api_url=${env.TMS_API_URL}" +
+                                                " -e tms_token=${env.VAULT_TMS_TOKEN}"
+                                            ansibleExecute(
+                                                command: "ansible-playbook ${env.ANSIBLE_DIR}/tms_send_result.yml ${paramsSendResult}"
+                                            )
+                                        }
+                                    }
+                                    finishStage()
+                                }
+                            }
                         }
                     }
                     finishStage()
@@ -354,24 +414,19 @@ pipeline {
                         allowEmptyArchive: false
                     )
                 }
-                String testRunStatus = tms.getTestRunById(params.TEST_RUN_ID).stateName
+                String testRunStatus = tms.getTestRunById(TEST_RUN_ID).stateName
                 if (testRunStatus in ['InProgress', 'NotStarted']) {
-                    tms.actionTestRunById(params.TEST_RUN_ID, 'stop')
+                    tms.actionTestRunById(TEST_RUN_ID, 'stop')
                     log.info 'Test run is Stoped'
                 }
-            }
-        }
 
-        cleanup {
-            cleanWs()
-            script {
                 startStage('test cleanup')
                 String extras = env.PLAY_EXTRAS
                 if (fileExists("${env.PROJECT_DIR}/.order.json")) {
                     Object order = readJSON(
                         file: "${env.PROJECT_DIR}/.order.json"
                     )
-                    Object groups = order.name.join(',')
+                    String groups = order.name.join(',')
                     extras = env.PLAY_EXTRAS + ' -l ' + groups
                     ansibleExecute(
                         command: \
@@ -385,6 +440,10 @@ pipeline {
                 }
                 finishStage('test cleanup')
             }
+        }
+
+        cleanup {
+            cleanWs()
         }
     }
 }
